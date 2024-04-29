@@ -1,0 +1,325 @@
+---
+title: "HVG Computing Script"
+author: "Renjie Wu"
+date: "`r Sys.Date()`"
+output: 
+  BiocStyle::html_document:
+    toc: true
+vignette: >
+---
+
+### YOU SHOULD HAVE RUN `scripts/05_velo2pt.ipynb` TO GET THE `uni_velocity_pseudotime_*.csv` FILE
+
+### MAKE SURE the workspace is scripts/
+
+```{r}
+script_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(script_path)
+```
+
+### Load necessary libraries
+
+```{r warning=FALSE,message=FALSE}
+library(gam)
+library(RColorBrewer)
+library(dplyr)
+library(MatrixGenerics)
+library(ggplot2)
+library(fields)
+
+scaleRow <- function(m, clip=10) {
+  m <- m %>% as.matrix
+  m <- (m - rowMeans(m)) / sqrt(rowVars(m))
+  m[m>clip] = clip
+  m[m<-clip] = -clip
+  return(m)
+}
+
+mytheme <- theme_bw() + 
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(), 
+          panel.background = element_rect(colour = "black", size = 1), 
+          axis.ticks.length = unit(0.25, "cm"), 
+          axis.title.x = element_text(size = 14, face = "bold"), 
+          axis.title.y = element_blank(),
+          axis.text = element_text(size = 10), 
+          legend.title = element_text(size = 14), 
+          legend.text = element_text(size = 12), 
+          legend.position = "right", 
+          title = element_text(size = 14, face = "bold"))
+```
+
+### Compare two pseudotime
+
+```{r}
+t1 <- read.csv("../data/mESC/uni_velocity_pseudotime_real.csv",
+               header = T, row.names = 1)
+t2 <- read.csv("../data/mESC/uni_velocity_pseudotime_pred.csv",
+               header = T, row.names = 1)
+
+identical(rownames(t1), rownames(t2))
+
+fit <- lm(t2$uni_velocity_pseudotime ~ t1$uni_velocity_pseudotime)
+rsquared <- summary(fit)$r.squared
+print(paste("R² =", rsquared))
+
+png("../fig/mESC/pt_cor.png", width = 800, height = 800, res = 150)
+
+plot(t1$uni_velocity_pseudotime, t2$uni_velocity_pseudotime,
+     pch=20, main="Real and Predicted Velocity Pseudo-time",
+     xlab="Real Pseudo-time", ylab="Predicted Pseudo-time")
+abline(fit, col="red", lwd=2)
+legend("topleft", legend = paste("R² =", round(rsquared, 4)),
+       col = "red", lty = 1, bty = "n", cex = 1)
+par(pty = "s")
+
+dev.off()
+```
+
+### HVG for real pseudotime
+
+```{r}
+logExpressionFiltered <- read.csv("../data/mESC/ExpressionData.csv", header = T, row.names = 1)
+HayashiCellTypes <- read.csv("../data/mESC/celltype.csv", header = T, row.names = 1)
+t <- read.csv("../data/mESC/uni_velocity_pseudotime_real.csv", header = T, row.names = 1)
+logExpressionFiltered <- logExpressionFiltered[, rownames(t)]
+HayashiCellTypes <- HayashiCellTypes[rownames(t), , drop=F]
+
+t <- t$uni_velocity_pseudotime
+Y <- logExpressionFiltered
+
+# YOU CAN RUN THE FOLLOWING COMMENTARY CODE OR SIMPLY READ THE SAVED DATA `real_gdf.csv`
+# # fit a GAM with a loess term for pseudotime
+# gam.pval <- apply(Y,1,function(z){
+#     suppressWarnings({
+#       tmp <- gam(z ~ lo(t), data = data.frame(z=z, t=t))
+#     })
+#     summary(tmp)[4][[1]][1,5]
+# })
+# 
+# set.seed(0)
+# dat <- logExpressionFiltered[, order(t, na.last = NA)] %>% scaleRow
+# 
+# k <- 5
+# km <- kmeans(dat, centers = k)
+# 
+# gene_df <- data.frame(pval = gam.pval[names(km$cluster)], 
+#                       cls = factor(km$cluster, levels = c(3, 1, 2, 5, 4)), #TODO
+#                       gene_name = names(km$cluster))
+# gene_df$tocenter <- apply(gene_df, MARGIN=1, FUN=function(v) {
+#     sqrt(sum((dat[v[3], ] - km$centers[v[2], ])**2))
+# })
+# real_gdf <- gene_df
+# write.csv(real_gdf, "../data/mESC/real_gdf.csv", quote = F)
+gene_df <- read.csv("../data/mESC/real_gdf.csv", header = T, row.names = 1)
+
+gene_df$cls <- factor(gene_df$cls, levels = c(3, 1, 2, 5, 4))
+
+topgenes <- gene_df %>%
+  filter(pval < 1e-20) %>%
+  group_by(cls) %>%
+  top_n(-30, tocenter) %>%
+  top_n(-3, pval) %>%
+  arrange(cls, pval) %>%
+  .[["gene_name"]]
+topgenes
+
+heatdata <- logExpressionFiltered[topgenes, order(t, na.last = NA)]
+heatclus <- as.factor(HayashiCellTypes[order(t, na.last = NA),])
+
+png("../fig/mESC/hvg_real.png", width = 800, height = 700, res = 150)
+heatmap(as.matrix(heatdata), Colv = NA, Rowv = NA,
+        ColSideColors = brewer.pal(6,"Set1")[heatclus],
+        labCol = F, cexRow = 1.2,
+        col = brewer.pal(9, "OrRd"), breaks = seq(-3,3, length.out=10))
+dev.off()
+```
+
+### hvg for pred pseudotime
+
+```{r}
+logExpressionFiltered <- read.csv("../data/mESC/ExpressionData.csv", header = T, row.names = 1)
+HayashiCellTypes <- read.csv("../data/mESC/celltype.csv", header = T, row.names = 1)
+t <- read.csv("../data/mESC/uni_velocity_pseudotime_pred.csv", header = T, row.names = 1)
+logExpressionFiltered <- logExpressionFiltered[, rownames(t)]
+HayashiCellTypes <- HayashiCellTypes[rownames(t), , drop=F]
+
+t <- t$uni_velocity_pseudotime
+Y <- logExpressionFiltered
+
+# YOU CAN RUN THE FOLLOWING COMMENTARY CODE OR SIMPLY READ THE SAVED DATA `pred_gdf.csv`
+# # fit a GAM with a loess term for pseudotime
+# gam.pval <- apply(Y,1,function(z){
+#     suppressWarnings({
+#       tmp <- gam(z ~ lo(t), data = data.frame(z=z, t=t))
+#     })
+#     summary(tmp)[4][[1]][1,5]
+# })
+# 
+# set.seed(0)
+# dat <- logExpressionFiltered[, order(t, na.last = NA)] %>% scaleRow
+# 
+# k <- 5
+# km <- kmeans(dat, centers = k)
+# 
+# gene_df <- data.frame(pval = gam.pval[names(km$cluster)], 
+#                       cls = factor(km$cluster, levels = c(3, 1, 2, 5, 4)), #TODO
+#                       gene_name = names(km$cluster))
+# gene_df$tocenter <- apply(gene_df, MARGIN=1, FUN=function(v) {
+#     sqrt(sum((dat[v[3], ] - km$centers[v[2], ])**2))
+# })
+# pred_gdf <- gene_df
+# write.csv(pred_gdf, "../data/mESC/pred_gdf.csv", quote = F)
+gene_df <- read.csv("../data/mESC/pred_gdf.csv", header = T, row.names = 1)
+
+gene_df$cls <- factor(gene_df$cls, levels = c(3, 1, 2, 5, 4))
+
+topgenes <- gene_df %>%
+  filter(pval < 1e-20) %>%
+  group_by(cls) %>%
+  top_n(-30, tocenter) %>%
+  top_n(-3, pval) %>%
+  arrange(cls, pval) %>%
+  .[["gene_name"]]
+topgenes
+
+heatdata <- logExpressionFiltered[topgenes, order(t, na.last = NA)]
+heatclus <- as.factor(HayashiCellTypes[order(t, na.last = NA),])
+
+png("../fig/mESC/hvg_pred.png", width = 800, height = 700, res = 150)
+heatmap(as.matrix(heatdata), Colv = NA, Rowv = NA,
+        ColSideColors = brewer.pal(6,"Set1")[heatclus],
+        labCol = F, cexRow = 1.2,
+        col = brewer.pal(9, "OrRd"), breaks = seq(-3,3, length.out=10))
+dev.off()
+```
+
+### Color bar
+
+```{r}
+colors <- brewer.pal(9, "OrRd")
+breaks <- seq(-3, 3, length.out = 10)
+plot.new()
+image.plot(legend.only = TRUE, col = colors, zlim = c(-3, 3), breaks = breaks, 
+           horizontal = FALSE, legend.shrink = 0.9, legend.width = 1.5, 
+           legend.mar = 5, axis.args = list(at = c(-3, 0, 3), las=1))
+
+```
+
+### Top 150 HVG for pred pseudotime & Color bar
+
+```{r}
+logExpressionFiltered <- read.csv("../data/mESC/ExpressionData.csv", header = T, row.names = 1)
+HayashiCellTypes <- read.csv("../data/mESC/celltype.csv", header = T, row.names = 1)
+t <- read.csv("../data/mESC/uni_velocity_pseudotime_pred.csv", header = T, row.names = 1)
+logExpressionFiltered <- logExpressionFiltered[, rownames(t)]
+HayashiCellTypes <- HayashiCellTypes[rownames(t), , drop=F]
+
+t <- t$uni_velocity_pseudotime
+
+gene_df <- read.csv("../data/mESC/pred_gdf.csv", header = T, row.names = 1)
+gene_df$cls <- factor(gene_df$cls, levels = c(3, 1, 2, 5, 4))
+
+topgenes <- gene_df %>% 
+  filter(pval < 1e-20) %>% 
+  group_by(cls) %>% 
+  top_n(-30, tocenter) %>% 
+  arrange(cls, pval) %>% 
+  .[["gene_name"]]
+
+heatdata <- logExpressionFiltered[topgenes, order(t, na.last = NA)]
+heatclus <- as.factor(HayashiCellTypes[order(t, na.last = NA),])
+
+png("../fig/mESC/hvg150_pred.png", width = 800, height = 700, res = 150)
+heatmap(as.matrix(heatdata), Colv = NA, Rowv = NA,
+        ColSideColors = brewer.pal(6,"Set1")[heatclus], 
+        labCol = F, labRow = F, 
+        col = brewer.pal(9, "OrRd"), breaks = seq(-3, 4, length.out=10))
+dev.off()
+
+
+colors <- brewer.pal(9, "OrRd")
+breaks <- seq(-3, 4, length.out = 10)
+plot.new()
+image.plot(legend.only = TRUE, col = colors, zlim = c(-3, 4), breaks = breaks, 
+           horizontal = FALSE, legend.shrink = 0.9, legend.width = 1.5, 
+           legend.mar = 5, axis.args = list(at = c(-3, 0, 4), las=1))
+
+```
+
+### GO Enrichment
+
+```{r}
+# genes to be used for GO Enrichment
+cat("All genes:", topgenes, "\n", sep="\n")
+cat("Early genes:", topgenes[91:150], "\n", sep="\n")
+cat("Late genes:", topgenes[1:60], "\n", sep="\n")
+
+# The enrichment analysis is performed by ToppGene Suite (ToppFun),
+# with default parameters. The results are saved to data/mESC/Topp_*.txt.
+```
+
+```{r}
+Topp_all <- read.table("../data/mESC/Topp_all.txt", header = T, sep = "\t", fill = T)
+
+df <- Topp_all %>% 
+    filter(Category=="GO: Biological Process", q.value.Bonferroni<0.05) %>% 
+    select(Name, q.value.Bonferroni, Hit.Count.in.Query.List) %>% 
+    arrange(q.value.Bonferroni) %>% head(10)
+
+colnames(df) <- c("BP", "p_adj", "count")
+df$`-log(p.adj)` <- -log10(df$p_adj)
+df$BP <- lapply(strwrap(df$BP, width = 25, simplify = F), function(x) paste0(x, collapse = "\n"))
+df$BP <- factor(df$BP, levels = df$BP[nrow(df):1])
+
+ggplot(df, aes(x = count, y = BP, fill = `-log(p.adj)`)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(high = "red", low = "blue", limits = c(3.5, 8.5)) +
+    mytheme +
+    ggtitle("BP Terms of All Genes")
+ggsave("../fig/mESC/BP_all.png", width = 4.5, height = 6)
+```
+
+```{r}
+Topp_early <- read.table("../data/mESC/Topp_early.txt", header = T, sep = "\t", fill = T)
+
+df <- Topp_early %>% 
+    filter(Category=="GO: Biological Process", q.value.Bonferroni<0.05) %>% 
+    select(Name, q.value.Bonferroni, Hit.Count.in.Query.List) %>% 
+    arrange(q.value.Bonferroni) %>% head(10)
+
+colnames(df) <- c("BP", "p_adj", "count")
+df$`-log(p.adj)` <- -log10(df$p_adj)
+df$BP <- lapply(strwrap(df$BP, width = 25, simplify = F), function(x) paste0(x, collapse = "\n"))
+df$BP <- factor(df$BP, levels = df$BP[nrow(df):1])
+
+ggplot(df, aes(x = count, y = BP, fill = `-log(p.adj)`)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(high = "red", low = "blue", limits = c(3.5, 8.5)) +
+    mytheme +
+    ggtitle("BP Terms of Early Genes")
+ggsave("../fig/mESC/BP_early.png", width = 4.5, height = 6)
+```
+
+```{r}
+Topp_late <- read.table("../data/mESC/Topp_late.txt", header = T, sep = "\t", fill = T)
+
+df <- Topp_late %>% 
+    filter(Category=="GO: Biological Process", q.value.Bonferroni<0.05) %>% 
+    select(Name, q.value.Bonferroni, Hit.Count.in.Query.List) %>% 
+    arrange(q.value.Bonferroni) %>% head(10)
+
+colnames(df) <- c("BP", "p_adj", "count")
+df$`-log(p.adj)` <- -log10(df$p_adj)
+df$BP <- lapply(strwrap(df$BP, width = 25, simplify = F), function(x) paste0(x, collapse = "\n"))
+df$BP <- factor(df$BP, levels = df$BP[nrow(df):1])
+
+ggplot(df, aes(x = count, y = BP, fill = `-log(p.adj)`)) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient(high = "red", low = "blue", limits = c(3.5, 8.5)) +
+    mytheme +
+    ggtitle("BP Terms of Late Genes")
+ggsave("../fig/mESC/BP_late.png", width = 4.5, height = 6)
+```
+
+### NEXT, YOU MAY RUN `scripts/07_gene_module.ipynb`

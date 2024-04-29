@@ -1,0 +1,244 @@
+---
+title: "Preprocessing script for Hayashi 2018"
+author: "Aditya Pratapa"
+date: "`r Sys.Date()`"
+output: 
+  BiocStyle::html_document:
+    toc: true
+vignette: >
+---
+
+### MAKE SURE the workspace is scripts/
+
+```{r}
+script_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(script_path)
+```
+
+### Load necessary libraries
+```{r warning=FALSE,message=FALSE}
+library(slingshot)
+library(plotly)
+library(gam)
+library(RColorBrewer)
+library(biomaRt)
+library(monocle)
+```
+
+## Read in input data (transcript tpm)
+
+### Read input files. The input file is from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE98664
+```{r warning=FALSE}
+Hayashi2018 <- read.table("../data/mESC/GSE98664_tpm_sailfish_mergedGTF_RamDA_mESC_differentiation_time_course.txt",
+                          sep = "\t", header = T, row.names = 1)
+```
+
+### Identify cell types
+```{r}
+HayashiCellTypes <- data.frame()
+for (col in colnames(Hayashi2018)){
+HayashiCellTypes[col,"Type"] <- strsplit(col,"_")[[1]][3]
+}
+tail(HayashiCellTypes)
+```
+
+## Prepare annotation
+
+```{r}
+# 从Ensembl数据库中加载了小鼠（mmusculus）的基因信息数据集
+mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+```
+
+```{r}
+# 从之前加载的Ensembl数据库中提取了基因的三个属性：ensembl_gene_id（Ensembl基因ID）、mgi_symbol（小鼠基因名称）和ensembl_transcript_id（Ensembl转录本ID），并将结果存储在annot变量中。
+annot <- getBM(c("ensembl_gene_id", "mgi_symbol", "ensembl_transcript_id"), mart=mouse)
+```
+
+
+### Add mgi symbol for the input genes
+
+```{r}
+Hayashi2018Copy <- Hayashi2018
+transcriptNamesVersion <- do.call(rbind, strsplit(rownames(Hayashi2018), "[.]"))
+rownames(Hayashi2018Copy) <- transcriptNamesVersion[, 1]
+
+t_id <- annot$ensembl_transcript_id
+dup <- which(duplicated(t_id))
+t_id[dup] <- paste("dup_", 1:length(dup)) # ignore duplicated
+
+id_dict = data.frame(id = 1:nrow(annot), row.names = t_id)
+mis <- setdiff(rownames(Hayashi2018Copy), rownames(id_dict))
+warning(paste(length(mis),
+              " transcript_id not found in annotation, accounting for ",
+              round(length(mis)/nrow(Hayashi2018Copy)*100, 2),
+              "% id in the matrix", sep = ""))
+id_dict <- rbind(id_dict, data.frame(id = rep(NA, length(mis)), row.names = mis))
+
+Hayashi2018Copy$mgi_symbol = annot[id_dict[rownames(Hayashi2018Copy), ], "mgi_symbol"]
+```
+
+## Prepare input data
+
+### Aggregate transcripts
+
+```{r}
+Hayashi2018Final <- aggregate(Hayashi2018[, rownames(HayashiCellTypes)],
+                              by=list(geneID=Hayashi2018Copy$mgi_symbol),
+                              FUN=sum)
+
+rownames(Hayashi2018Final) <- Hayashi2018Final[, 1]
+Hayashi2018Final <- Hayashi2018Final[-1, -1]
+rownames(Hayashi2018Final) <- toupper(rownames(Hayashi2018Final))
+```
+
+### Find outliers
+
+```{r}
+tmp <- colSums(Hayashi2018Final)
+hist(tmp)
+```
+
+```{r}
+to_rmv <- which(abs(tmp-mean(tmp)) > 5*sd(tmp))
+Hayashi2018Final <- Hayashi2018Final[, -to_rmv, drop=FALSE]
+HayashiCellTypes <- HayashiCellTypes[-to_rmv, , drop=FALSE]
+```
+
+## Save / Read data (YOU CAN START FROM HERE)
+
+```{r}
+write.csv(Hayashi2018Final, file = "../data/mESC/geneTPM.csv", quote = FALSE)
+write.csv(HayashiCellTypes, file = "../data/mESC/celltype.csv", quote = FALSE)
+```
+
+```{r}
+Hayashi2018Final <- read.csv("../data/mESC/geneTPM.csv",
+                             header = T, row.names = 1)
+HayashiCellTypes <- read.csv("../data/mESC/celltype.csv",
+                             header = T, row.names = 1)
+```
+
+## Downstream processing
+
+### Prepare CDS
+
+```{r warning=FALSE, fig.height=10}
+# The data is TPM
+cd <- new("AnnotatedDataFrame", data = HayashiCellTypes)
+gd <- new("AnnotatedDataFrame",
+          data = data.frame(rownames(Hayashi2018Final),
+                            row.names = rownames(Hayashi2018Final)))
+
+CDS <- newCellDataSet(as(as.matrix(Hayashi2018Final), "sparseMatrix"),
+                      phenoData = cd,
+                      featureData = gd,
+                      lowerDetectionLimit = 0.1,
+                      expressionFamily = tobit(Lower = 0.1))
+
+# Next, use it to estimate RNA counts
+rpc_matrix <- relative2abs(CDS, method = "num_genes")
+
+# Now, make a new CellDataSet using the RNA counts
+CDS <- newCellDataSet(as(as.matrix(rpc_matrix), "sparseMatrix"),
+                      phenoData =  cd,
+                      featureData = gd,
+                      lowerDetectionLimit = 0.5,
+                      expressionFamily = negbinomial.size())
+```
+
+
+```{r}
+CDS <- estimateSizeFactors(CDS)
+CDS <- estimateDispersions(CDS)
+```
+
+
+```{r}
+CDS <- detectGenes(CDS, min_expr = 0.1)
+print(head(fData(CDS)))
+expressed_genes <- row.names(subset(fData(CDS),
+                                    num_cells_expressed >= 0.1*dim(cd)[1]))
+```
+
+### Log Expr
+
+```{r}
+logExpressionFiltered <- log2(as.matrix(exprs(CDS[expressed_genes,])+1))
+```
+
+### PCA
+
+```{r}
+# Compute PCA
+pcaRes <- prcomp(t(logExpressionFiltered), scale. = FALSE)
+rd1 <- as.data.frame(cbind(PC1 = pcaRes$x[,1], PC2 = pcaRes$x[,2], PC3 = pcaRes$x[,3]))
+
+plot_ly(as.data.frame(pcaRes$x), x=~PC1, y= ~PC2,  color = HayashiCellTypes$Type, colors = brewer.pal(5,"Set1"))
+
+write.csv(pcaRes$x[, 1:30], "../data/mESC/pca30.csv", quote = F)
+```
+
+### Run slingshot
+
+```{r}
+slingshotPT <- slingshot(rd1, reducedDim = rd1,
+                         clusterLabels = HayashiCellTypes$Type,
+                         start.clus = "00h", end.clus = "72h")
+ssPT <- slingPseudotime(slingshotPT)
+ssPT <- as.data.frame(ssPT)
+
+plot_ly(rd1, x=~PC1, y=~PC2,  color=ssPT$Lineage1)
+```
+
+### Find variable genes along the trajectory
+
+```{r}
+t <- ssPT$Lineage1
+
+
+Y <- logExpressionFiltered
+var1K <- names(sort(apply(Y,1,var),decreasing = TRUE))
+Y <- Y[var1K, ]
+
+# fit a GAM with a loess term for pseudotime
+gam.pval <- apply(Y,1,function(z){
+  d <- data.frame(z=z, t=t)
+  suppressWarnings({
+    tmp <- gam(z ~ lo(t), data=d)
+  })
+  p <- summary(tmp)[4][[1]][1,5]
+  p
+})
+```
+
+
+```{r}
+topgenes <- names(sort(gam.pval, decreasing = FALSE))[1:15]
+heatdata <- logExpressionFiltered[topgenes, order(t, na.last = NA)]
+heatclus <- as.factor(HayashiCellTypes[order(t, na.last = NA),])
+
+heatmap(as.matrix(heatdata), Colv = NA,
+        ColSideColors = brewer.pal(6,"Set1")[heatclus], labCol = FALSE)
+```
+
+### Save results
+
+```{r}
+exprData <- logExpressionFiltered
+colnames(exprData) <- gsub(pattern = "[.]", replacement = "_", colnames(exprData))
+
+ptData <- data.frame(ssPT$Lineage1)
+rownames(ptData) <- colnames(exprData)
+colnames(ptData) <- "PseudoTime"
+
+geneData <- data.frame(sort(gam.pval, decreasing = FALSE))
+colnames(geneData) <- "VGAMpValue"
+geneData[,"Variance"] <- apply(logExpressionFiltered[rownames(geneData),],1,var)
+
+
+write.csv(x = exprData, file = "../data/mESC/OriginalExpressionData.csv", quote = FALSE)
+write.csv(x = ptData, file = "../data/mESC/PseudoTime.csv", quote = FALSE)
+write.csv(x = geneData, file = "../data/mESC/GeneOrdering.csv", quote = FALSE)
+```
+
+### NEXT, YOU MAY RUN `scripts/02_generateExInputs.py`

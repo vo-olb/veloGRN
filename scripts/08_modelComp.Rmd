@@ -1,0 +1,144 @@
+---
+title: "Model Comparing Script"
+author: "Renjie Wu"
+date: "`r Sys.Date()`"
+output: 
+  BiocStyle::html_document:
+    toc: true
+vignette: >
+---
+
+### YOU SHOULD HAVE RUN `scripts/03_model.sh` TO GET METRICS FOR DIFFERENT MODELS
+
+### MAKE SURE the workspace is scripts/
+
+```{r}
+script_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+setwd(script_path)
+```
+
+### Load necessary libraries
+
+```{r}
+library(ggplot2)
+library(RColorBrewer)
+library(dplyr)
+library(stringr)
+
+mytheme <- theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size = 1),
+        axis.ticks.length = unit(0.25, "cm"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.position = "none")
+
+plot_velo <- function(velofile, orderedExpr, pcaRes, ct,
+                      k = 0.2, in_len = 32, out_len = 32, save = TRUE) {
+  velo <- read.csv(velofile, header = FALSE)
+  velo <- t(velo)
+
+  next_point <- velo * k + orderedExpr[, in_len:ncol(orderedExpr)]
+  proj_next <- predict(pcaRes, newdata = t(next_point))[, 1:2] %>% as.data.frame
+
+  ord <- colnames(orderedExpr)
+  df <- data.frame(cell_x = pcaRes$x[ord, "PC1"], cell_y = pcaRes$x[ord, "PC2"],
+                   c = ct[ord, "Type"])[in_len:ncol(orderedExpr), ]
+  df$next_x <- proj_next$PC1
+  df$next_y <- proj_next$PC2
+
+  p <- ggplot(df[1:(nrow(df) - out_len), ], aes(x = cell_x, y = cell_y)) +
+    geom_point(aes(color = c), size = 2) +
+    scale_color_manual(values = brewer.pal(5, "Set1")) +
+    geom_segment(aes(xend = next_x, yend = next_y),
+                 arrow = arrow(length = unit(0.1, "inches"))) +
+    mytheme +
+    xlab("PC_1") + ylab("PC_2") +
+    xlim(-32, 29) + ylim(-15, 16)
+
+  if (save) {
+    path <- str_extract(velofile, "(?<=/)[^/]*(?=/metrics/velo.csv)")
+    ggsave(paste0("../fig/mESC/velo_", path, ".png"), plot = p,
+           width = 6, height = 4, dpi = 400)
+  }
+  return(p)
+}
+```
+
+### Read in matrics
+
+```{r}
+log_lines <- readLines("../test/model_test/log.txt")
+losses <- c()
+
+for (line in log_lines) {
+  if (grepl("test_loss", line)) {
+    test_loss <- regmatches(line, regexpr("\\d+\\.\\d+", line))
+    losses <- c(losses, as.double(test_loss))
+  }
+}
+
+losses <- data.frame(loss = losses,
+                     model = rep(c("normal",
+                                   "no_encoder",
+                                   "no_Attention",
+                                   "no_GCN"), each = 5),
+                     rep = rep(1:5, times = 4))
+
+losses
+```
+
+### Plot
+
+```{r}
+mean_losses <- aggregate(x = losses[, "loss", drop = FALSE],
+                         by = list(model = losses$model), FUN = mean)
+se_losses <- aggregate(x = losses[, "loss", drop = FALSE],
+                       by = list(model = losses$model),
+                       FUN = function(x) sd(x) / sqrt(length(x)))
+mean_losses <- merge(mean_losses, se_losses, by = "model")
+mean_losses$model <- factor(mean_losses$model, levels = c("no_encoder",
+                                                          "no_GCN",
+                                                          "no_Attention",
+                                                          "normal"))
+mean_losses
+
+# 绘制柱状图
+ggplot(mean_losses, aes(x = model, y = loss.x, fill = model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = brewer.pal(4, "Set2")) +
+  geom_errorbar(aes(ymin = loss.x - loss.y, ymax = loss.x + loss.y),
+                width = 0.3, position = position_dodge(0.9)) +
+  labs(title = "Comparison of Different Models",
+       x = "Model",
+       y = "Mean Loss") +
+  mytheme
+ggsave("../fig/mESC/model_comp.png", width = 4, height = 6, dpi = 400)
+```
+
+### Compare velo
+
+```{r}
+logExpressionFiltered <- read.csv("../data/mESC/ExpressionData.csv",
+                                  header = TRUE, row.names = 1)
+pcaRes <- prcomp(t(logExpressionFiltered), scale. = FALSE)
+
+pt <- read.csv("../data/mESC/PseudoTime.csv", header = TRUE, row.names = 1)
+ord <- order(pt$PseudoTime)
+orderedExpr <- logExpressionFiltered[, ord]
+
+ct <- read.csv("../data/mESC/celltype.csv",
+               header = TRUE, row.names = 1)
+```
+
+```{r}
+plot_velo("../test/model_test/normal_1/metrics/velo.csv",
+          orderedExpr = orderedExpr, pcaRes = pcaRes, ct = ct)
+```
+
+```{r}
+plot_velo("../test/model_test/no_GCN_1/metrics/velo.csv",
+          orderedExpr = orderedExpr, pcaRes = pcaRes, ct = ct)
+```
